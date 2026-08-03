@@ -1,4 +1,6 @@
 import os
+import time
+import threading
 import requests
 import pandas as pd
 import yfinance as yf
@@ -7,6 +9,9 @@ from flask import Flask, request
 app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+# Введіть сюди ваш Telegram Chat ID, щоб бот знав, куди надсилати автоматичні сигнали
+# (його можна дізнатися, написавши боту @userinfobot у Telegram)
+MY_CHAT_ID = os.environ.get("MY_CHAT_ID", "") 
 
 PAIRS = [
     "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCAD=X", 
@@ -17,6 +22,8 @@ PAIRS = [
 TIMEFRAME = "5m"
 
 def send_telegram_message(chat_id, text, reply_markup=None):
+    if not chat_id:
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     if reply_markup:
@@ -37,7 +44,7 @@ def analyze_single_pair(pair):
     try:
         df = yf.download(pair, period="5d", interval=TIMEFRAME, progress=False)
         if df.empty or len(df) < 200:
-            return f"⚠️ Недостатньо даних для {pair.replace('=X', '')}"
+            return None
         
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
@@ -75,13 +82,33 @@ def analyze_single_pair(pair):
             exp_min = 15
 
         if current_price > ema200 and in_fib_zone and is_bullish_ob and rsi < 40:
-            return f"🟢 **BUY (Експірація: {exp_min} хв)** | 🌟 **{clean_name}**\nЦіна: `{current_price:.5f}` | RSI: `{rsi:.1f}`"
+            return f"🚨 **АВТО-СИГНАЛ: BUY** 🟢\n🌟 Пара: **{clean_name}**\n⏱ Експірація: `{exp_min} хв`\nЦіна: `{current_price:.5f}` | RSI: `{rsi:.1f}`"
         elif current_price < ema200 and in_fib_zone and is_bearish_ob and rsi > 60:
-            return f"🔴 **SELL (Експірація: {exp_min} хв)** | 🌟 **{clean_name}**\nЦіна: `{current_price:.5f}` | RSI: `{rsi:.1f}`"
-        else:
-            return f"📭 По парі 🌟 **{clean_name}** зараз немає сигналу за умовами стратегії.\nЦіна: `{current_price:.5f}` | RSI: `{rsi:.1f}`"
+            return f"🚨 **АВТО-СИГНАЛ: SELL** 🔴\n🌟 Пара: **{clean_name}**\n⏱ Експірація: `{exp_min} хв`\nЦіна: `{current_price:.5f}` | RSI: `{rsi:.1f}`"
+        
+        return None
     except Exception as e:
-        return f"Помилка при аналізі {pair}: {e}"
+        print(f"Помилка аналізу {pair}: {e}")
+        return None
+
+# Фоновий потік для автомоніторингу ринку
+def background_monitor():
+    while True:
+        try:
+            if MY_CHAT_ID:
+                for pair in PAIRS:
+                    signal = analyze_single_pair(pair)
+                    if signal:
+                        send_telegram_message(MY_CHAT_ID, signal)
+                    time.sleep(3) # Пауза між запитами, щоб не перевантажувати API
+        except Exception as e:
+            print(f"Помилка у фоновому потоці: {e}")
+        
+        # Перевіряти ринок кожні 5 хвилин
+        time.sleep(300)
+
+# Запускаємо фоновий моніторинг при стартові додатка
+threading.Thread(target=background_monitor, daemon=True).start()
 
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
@@ -95,10 +122,10 @@ def telegram_webhook():
 
         if text == "/start":
             reply = (
-                "👋 Вітаю! Бот Racio_1 активний.\n"
-                "⏱ Ручний вибір пари з динамічною експірацією (**від 5 до 30 хв**).\n\n"
+                "👋 Вітаю! Автоматичний бот Racio_1 активовано.\n"
+                "🔄 Бот самостійно сканує ринок і надсилатиме сигнали у разі їх появи.\n\n"
                 "📌 **Команди:**\n"
-                "/signal — Вибрати пару для аналізу"
+                "/signal — Перевірити пару вручну"
             )
             send_telegram_message(chat_id, reply)
 
@@ -113,7 +140,7 @@ def telegram_webhook():
                     row = []
             if row:
                 keyboard.append(row)
-            send_telegram_message(chat_id, "🔍 **Виберіть валютну пару для перевірки:**", {"inline_keyboard": keyboard})
+            send_telegram_message(chat_id, "🔍 **Виберіть валютну пару для ручної перевірки:**", {"inline_keyboard": keyboard})
 
     elif "callback_query" in update:
         query = update["callback_query"]
@@ -121,11 +148,25 @@ def telegram_webhook():
         pair = query["data"]
         
         send_telegram_message(chat_id, f"⏳ Аналізую графік для `{pair.replace('=X', '')}`...")
-        result = analyze_single_pair(pair)
-        send_telegram_message(chat_id, result)
+        
+        # Ручна перевірка повертає статус у будь-якому разі
+        try:
+            df = yf.download(pair, period="5d", interval=TIMEFRAME, progress=False)
+            if not df.empty:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                cp = df['Close'].iloc[-1]
+                rsi = calculate_rsi(df['Close'], 14).iloc[-1]
+                res = analyze_single_pair(pair)
+                if res:
+                    send_telegram_message(chat_id, res)
+                else:
+                    send_telegram_message(chat_id, f"📭 По парі 🌟 **{pair.replace('=X', '')}** зараз немає сигналу.\nЦіна: `{cp:.5f}` | RSI: `{rsi:.1f}`")
+        except Exception as e:
+            send_telegram_message(chat_id, f"Помилка: {e}")
 
     return "OK", 200
 
 @app.route("/")
 def home():
-    return "Bot is running!"
+    return "Auto-bot is running!"
