@@ -6,7 +6,7 @@ from flask import Flask, request
 
 app = Flask(__name__)
 
-TELEGRAM_TOKEN = "8884979632:AAH9RZE8XZ2qK9eqyzvLofk854IcOQW6HFk"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
 PAIRS = [
     "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCAD=X", 
