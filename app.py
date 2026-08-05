@@ -147,7 +147,6 @@ def analyze_all_timeframes(pair):
             if diff == 0:
                 continue
                 
-            # Комбінація SMC та Fib OTE (Optimal Trade Entry: 61.8% - 78.6%)
             fib_618 = swing_high - (diff * 0.618)
             fib_786 = swing_high - (diff * 0.786)
             in_ote_buy = (current_price <= fib_618) and (current_price >= fib_786)
@@ -156,7 +155,6 @@ def analyze_all_timeframes(pair):
             fib_sell_high = swing_low + (diff * 0.618)
             in_ote_sell = (current_price >= fib_sell_low) and (current_price <= fib_sell_high)
 
-            # SMC Order Block / Поглинання імпульсу
             is_bullish_ob = (close.iloc[-1] > open_p.iloc[-1]) and (close.iloc[-2] < open_p.iloc[-2])
             is_bearish_ob = (close.iloc[-1] < open_p.iloc[-1]) and (close.iloc[-2] > open_p.iloc[-2])
 
@@ -191,7 +189,6 @@ def analyze_all_timeframes(pair):
             else:
                 exp_str = f"{exp_min} хв"
 
-            # Логіка входу: Тренд (EMA200) + Зона OTE (Fib) + Ордер-Блок (SMC) + Стохастик
             if current_price > ema200 and in_ote_buy and is_bullish_ob and k_val < 40:
                 found_signal = "BUY"
                 signal_text = f"🟢 **BUY (SMC + Fib | ТФ: {tf})** | 🌟 **{clean_name}**\n⏱ Експірація: `{exp_str}`\nЦіна: `{current_price:.5f}` | Stoch %K: `{k_val:.1f}`"
@@ -204,11 +201,7 @@ def analyze_all_timeframes(pair):
             continue
             
     log_stat(pair, found_signal)
-    
-    if found_signal != "NO_SIGNAL":
-        return signal_text
-    else:
-        return f"📭 По парі 🌟 **{clean_name}** (ТФ від 1хв до 4г) зараз немає сигналу за стратегією SMC + Фібоначі."
+    return found_signal, signal_text
 
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
@@ -229,23 +222,25 @@ def telegram_webhook():
 
         if text == "/start":
             reply = (
-                "👋 Вітаю! Бот зі стратегією SMC + Фібоначі + Стохастик готовий до роботи.\n\n"
-                "Використовуйте кнопки під полем введення для швидкого доступу:"
+                "👋 Вітаю! Бот налаштований на масове сканування.\n\n"
+                "Натисніть **«📊 Аналізувати пару»**, щоб перевірити всі валютні пари одразу:"
             )
             send_telegram_message(chat_id, reply, main_menu_keyboard)
 
         elif text in ["/signal", "📊 Аналізувати пару"]:
-            keyboard = []
-            row = []
+            send_telegram_message(chat_id, "⏳ Починаю масове сканування всіх валютних пар за стратегією SMC + Фібоначі...")
+            
+            signals_found = 0
             for pair in PAIRS:
-                clean_name = pair.replace("=X", "")
-                row.append({"text": clean_name, "callback_data": f"pair|{pair}"})
-                if len(row) == 2:
-                    keyboard.append(row)
-                    row = []
-            if row:
-                keyboard.append(row)
-            send_telegram_message(chat_id, "🔍 **Виберіть валютну пару для аналізу (SMC + Fib):**", {"inline_keyboard": keyboard})
+                found_signal, signal_text = analyze_all_timeframes(pair)
+                if found_signal != "NO_SIGNAL":
+                    send_telegram_message(chat_id, signal_text)
+                    signals_found += 1
+            
+            if signals_found == 0:
+                send_telegram_message(chat_id, "📭 Зараз немає активних сигналів ні по одній парі.")
+            else:
+                send_telegram_message(chat_id, f"✅ Сканування завершено. Знайдено сигналів: {signals_found}")
 
         elif text in ["/stats", "📈 Статистика"]:
             stats_day, stats_week, stats_all = get_statistics()
@@ -264,15 +259,7 @@ def telegram_webhook():
         message_id = query["message"]["message_id"]
         data = query["data"]
 
-        if data.startswith("pair|"):
-            _, pair = data.split("|")
-            clean_name = pair.replace("=X", "")
-            
-            send_telegram_message(chat_id, f"⏳ Сканую таймфрейми за SMC + Fib для **{clean_name}**...")
-            result = analyze_all_timeframes(pair)
-            send_telegram_message(chat_id, result)
-
-        elif data.startswith("stats|"):
+        if data.startswith("stats|"):
             _, period = data.split("|")
             stats_day, stats_week, stats_all = get_statistics()
             if period == "day":
@@ -304,4 +291,4 @@ def telegram_webhook():
 
 @app.route("/")
 def home():
-    return "SMC + Fib Bot is running!"
+    return "Mass Scan SMC Bot is running!"
