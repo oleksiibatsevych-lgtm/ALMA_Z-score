@@ -15,7 +15,6 @@ PAIRS = [
     "AUDJPY=X", "AUDCAD=X", "EURAUD=X", "CADJPY=X", "GBPCHF=X"
 ]
 
-# Діапазон завантаження даних (глибина до трьох місяців)
 SCAN_TIMEFRAMES = {
     "1m": "5d",
     "5m": "5d",
@@ -25,7 +24,6 @@ SCAN_TIMEFRAMES = {
     "4h": "3mo"
 }
 
-# Сховище для статистики в пам'яті
 stats_history = []
 
 def log_stat(pair, signal_type):
@@ -33,7 +31,7 @@ def log_stat(pair, signal_type):
     stats_history.append({
         "timestamp": datetime.now(),
         "pair": pair.replace("=X", ""),
-        "signal": signal_type # "BUY", "SELL", або "NO_SIGNAL"
+        "signal": signal_type
     })
 
 def get_statistics():
@@ -54,20 +52,17 @@ def get_statistics():
             if pair not in s_dict:
                 s_dict[pair] = {"requests": 0, "buy": 0, "sell": 0, "none": 0}
                 
-        # Весь час
         stats_all[pair]["requests"] += 1
         if sig == "BUY": stats_all[pair]["buy"] += 1
         elif sig == "SELL": stats_all[pair]["sell"] += 1
         else: stats_all[pair]["none"] += 1
         
-        # Тиждень
         if t >= week_ago:
             stats_week[pair]["requests"] += 1
             if sig == "BUY": stats_week[pair]["buy"] += 1
             elif sig == "SELL": stats_week[pair]["sell"] += 1
             else: stats_week[pair]["none"] += 1
             
-        # Доба
         if t >= day_ago:
             stats_day[pair]["requests"] += 1
             if sig == "BUY": stats_day[pair]["buy"] += 1
@@ -108,12 +103,12 @@ def edit_telegram_message(chat_id, message_id, text, reply_markup=None):
     except Exception as e:
         print(f"Помилка редагування: {e}")
 
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+def calculate_stochastic(df, k_period=14, d_period=3):
+    low_min = df['Low'].rolling(window=k_period).min()
+    high_max = df['High'].rolling(window=k_period).max()
+    k_line = 100 * ((df['Close'] - low_min) / (high_max - low_min))
+    d_line = k_line.rolling(window=d_period).mean()
+    return k_line, d_line
 
 def analyze_all_timeframes(pair):
     clean_name = pair.replace("=X", "")
@@ -132,11 +127,18 @@ def analyze_all_timeframes(pair):
             close = df['Close']
             high = df['High']
             low = df['Low']
+            open_p = df['Open']
             
             ema_span = 200 if len(close) >= 200 else len(close) - 1
             ema200 = close.ewm(span=ema_span, adjust=False).mean().iloc[-1]
             current_price = close.iloc[-1]
-            rsi = calculate_rsi(close, 14).iloc[-1]
+            
+            k_line, d_line = calculate_stochastic(df)
+            k_val = k_line.iloc[-1]
+            d_val = d_line.iloc[-1]
+            
+            if pd.isna(k_val) or pd.isna(d_val):
+                continue
             
             swing_high = high.iloc[-50:].max() if len(high) >= 50 else high.max()
             swing_low = low.iloc[-50:].min() if len(low) >= 50 else low.min()
@@ -145,19 +147,24 @@ def analyze_all_timeframes(pair):
             if diff == 0:
                 continue
                 
-            fib_50 = swing_high - (diff * 0.5)
+            # Комбінація SMC та Fib OTE (Optimal Trade Entry: 61.8% - 78.6%)
             fib_618 = swing_high - (diff * 0.618)
-            in_fib_zone = (current_price <= fib_50) and (current_price >= fib_618)
-            
-            is_bullish_ob = (close.iloc[-2] < df['Open'].iloc[-2]) and (close.iloc[-1] > df['Open'].iloc[-1]) and ((close.iloc[-1] - df['Open'].iloc[-1]) > (high.iloc[-1] - low.iloc[-1]) * 0.6)
-            is_bearish_ob = (close.iloc[-2] > df['Open'].iloc[-2]) and (close.iloc[-1] < df['Open'].iloc[-1]) and ((df['Open'].iloc[-1] - close.iloc[-1]) > (high.iloc[-1] - low.iloc[-1]) * 0.6)
+            fib_786 = swing_high - (diff * 0.786)
+            in_ote_buy = (current_price <= fib_618) and (current_price >= fib_786)
+
+            fib_sell_low = swing_low + (diff * 0.382)
+            fib_sell_high = swing_low + (diff * 0.618)
+            in_ote_sell = (current_price >= fib_sell_low) and (current_price <= fib_sell_high)
+
+            # SMC Order Block / Поглинання імпульсу
+            is_bullish_ob = (close.iloc[-1] > open_p.iloc[-1]) and (close.iloc[-2] < open_p.iloc[-2])
+            is_bearish_ob = (close.iloc[-1] < open_p.iloc[-1]) and (close.iloc[-2] > open_p.iloc[-2])
 
             candle_size = high.iloc[-1] - low.iloc[-1]
             avg_size = (high - low).rolling(20).mean().iloc[-1]
             if pd.isna(avg_size) or avg_size == 0:
                 avg_size = candle_size
 
-            # Базовий час експлуатації залежно від таймфрейму (від 1 хв до 4 годин / 240 хв)
             if tf == "1m": base_exp = 5
             elif tf == "5m": base_exp = 15
             elif tf == "15m": base_exp = 30
@@ -175,10 +182,8 @@ def analyze_all_timeframes(pair):
             else:
                 exp_min = base_exp
             
-            # Обмежуємо діапазон експірації від 1 хв до 4 годин (240 хв)
             exp_min = max(1, min(240, exp_min))
 
-            # Форматування виведення часу (години або хвилини)
             if exp_min >= 60:
                 hours = exp_min // 60
                 mins = exp_min % 60
@@ -186,13 +191,14 @@ def analyze_all_timeframes(pair):
             else:
                 exp_str = f"{exp_min} хв"
 
-            if current_price > ema200 and in_fib_zone and is_bullish_ob and rsi < 40:
+            # Логіка входу: Тренд (EMA200) + Зона OTE (Fib) + Ордер-Блок (SMC) + Стохастик
+            if current_price > ema200 and in_ote_buy and is_bullish_ob and k_val < 40:
                 found_signal = "BUY"
-                signal_text = f"🟢 **BUY (ТФ: {tf})** | 🌟 **{clean_name}**\n⏱ Експірація: `{exp_str}`\nЦіна: `{current_price:.5f}` | RSI: `{rsi:.1f}`"
+                signal_text = f"🟢 **BUY (SMC + Fib | ТФ: {tf})** | 🌟 **{clean_name}**\n⏱ Експірація: `{exp_str}`\nЦіна: `{current_price:.5f}` | Stoch %K: `{k_val:.1f}`"
                 break
-            elif current_price < ema200 and in_fib_zone and is_bearish_ob and rsi > 60:
+            elif current_price < ema200 and in_ote_sell and is_bearish_ob and k_val > 60:
                 found_signal = "SELL"
-                signal_text = f"🔴 **SELL (ТФ: {tf})** | 🌟 **{clean_name}**\n⏱ Експірація: `{exp_str}`\nЦіна: `{current_price:.5f}` | RSI: `{rsi:.1f}`"
+                signal_text = f"🔴 **SELL (SMC + Fib | ТФ: {tf})** | 🌟 **{clean_name}**\n⏱ Експірація: `{exp_str}`\nЦіна: `{current_price:.5f}` | Stoch %K: `{k_val:.1f}`"
                 break
         except Exception as e:
             continue
@@ -202,7 +208,7 @@ def analyze_all_timeframes(pair):
     if found_signal != "NO_SIGNAL":
         return signal_text
     else:
-        return f"📭 По парі 🌟 **{clean_name}** (ТФ від 1хв до 4г) зараз немає сигналу за стратегією."
+        return f"📭 По парі 🌟 **{clean_name}** (ТФ від 1хв до 4г) зараз немає сигналу за стратегією SMC + Фібоначі."
 
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
@@ -210,20 +216,25 @@ def telegram_webhook():
     if not update:
         return "OK", 200
         
+    main_menu_keyboard = {
+        "keyboard": [
+            [{"text": "📊 Аналізувати пару"}, {"text": "📈 Статистика"}]
+        ],
+        "resize_keyboard": True
+    }
+
     if "message" in update:
         chat_id = update["message"]["chat"]["id"]
         text = update["message"].get("text", "")
 
         if text == "/start":
             reply = (
-                "👋 Вітаю! Бот працює за запитом (глибина даних до 3 місяців, експірація від 1 хв до 4 годин).\n\n"
-                "📌 **Команди:**\n"
-                "/signal — Вибрати пару для аналізу\n"
-                "/stats — Переглянути статистику запитів по парах"
+                "👋 Вітаю! Бот зі стратегією SMC + Фібоначі + Стохастик готовий до роботи.\n\n"
+                "Використовуйте кнопки під полем введення для швидкого доступу:"
             )
-            send_telegram_message(chat_id, reply)
+            send_telegram_message(chat_id, reply, main_menu_keyboard)
 
-        elif text == "/signal":
+        elif text in ["/signal", "📊 Аналізувати пару"]:
             keyboard = []
             row = []
             for pair in PAIRS:
@@ -234,9 +245,9 @@ def telegram_webhook():
                     row = []
             if row:
                 keyboard.append(row)
-            send_telegram_message(chat_id, "🔍 **Виберіть валютну пару для аналізу (1хв — 4 год):**", {"inline_keyboard": keyboard})
+            send_telegram_message(chat_id, "🔍 **Виберіть валютну пару для аналізу (SMC + Fib):**", {"inline_keyboard": keyboard})
 
-        elif text == "/stats":
+        elif text in ["/stats", "📈 Статистика"]:
             stats_day, stats_week, stats_all = get_statistics()
             keyboard = {
                 "inline_keyboard": [
@@ -257,7 +268,7 @@ def telegram_webhook():
             _, pair = data.split("|")
             clean_name = pair.replace("=X", "")
             
-            send_telegram_message(chat_id, f"⏳ Сканую таймфрейми (глибина до 3 міс) для **{clean_name}**...")
+            send_telegram_message(chat_id, f"⏳ Сканую таймфрейми за SMC + Fib для **{clean_name}**...")
             result = analyze_all_timeframes(pair)
             send_telegram_message(chat_id, result)
 
@@ -293,4 +304,4 @@ def telegram_webhook():
 
 @app.route("/")
 def home():
-    return "Optimized Bot is running!"
+    return "SMC + Fib Bot is running!"
