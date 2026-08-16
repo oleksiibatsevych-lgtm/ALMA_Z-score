@@ -247,6 +247,20 @@ def get_pairs_grid_keyboard():
   return {"inline_keyboard": keyboard}
 
 
+def set_webhook_automatically():
+  if TELEGRAM_TOKEN:
+    render_url = os.environ.get(
+        "RENDER_EXTERNAL_URL", "https://fibonacci-4ast.onrender.com"
+    )
+    webhook_url = f"{render_url}/webhook"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={webhook_url}"
+    try:
+      resp = requests.get(url, timeout=10).json()
+      print(f"Статус налаштування вебхука: {resp}")
+    except Exception as e:
+      print(f"Помилка встановлення вебхука: {e}")
+
+
 # --- ЗАВАНТАЖЕННЯ ДАНИХ РИНКУ ---
 def get_market_data(ticker, timeframe):
   try:
@@ -456,7 +470,7 @@ def telegram_webhook():
       pair_name = data.replace("analyze_", "")
 
       def scan_single(c_id, p_name):
-        send_telegram_message(c_id, f"🔍 Скаנую пару {p_name} по всіх таймфреймах...")
+        send_telegram_message(c_id, f"🔍 Сканую пару {p_name} по всіх таймфреймах...")
         found = 0
         for tf in ALL_TIMEFRAMES:
           time.sleep(1.0)
@@ -492,5 +506,6 @@ def telegram_webhook():
 
 if __name__ == "__main__":
   init_db()
+  set_webhook_automatically()  # Автоматично прив'язує вебхук при запуску
   threading.Thread(target=automated_trade_checker, daemon=True).start()
   app.run(host="0.0.0.0", port=10000)
