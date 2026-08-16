@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+import json
 import os
 import sqlite3
 import threading
@@ -140,24 +141,35 @@ def get_stats_report(days=None):
   return win, loss, total, winrate
 
 
-# --- АВТОМАТИЧНИЙ ФОНОВЙ ПЕРЕВІРНИК УГОД ---
+# --- ДИНАМІЧНИЙ ФОНОВЙ ПЕРЕВІРНИК ЗА ЧАСОМ ЕКСПІРАЦІЇ ---
 def automated_trade_checker():
-  """Фоновий потік, який автоматично перевіряє завершені угоди без участі людини."""
+  """Спить рівно до часу експірації наступної угоди, мінімізуючи запити."""
   while True:
     try:
-      time.sleep(30)  # Перевірка кожні 30 секунд
       now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
       conn = sqlite3.connect(DB_NAME)
       cursor = conn.cursor()
+
+      # Знаходимо угоди, час експірації яких уже настав
       cursor.execute(
           "SELECT id, chat_id, pair, signal, price, target_time FROM trades"
           " WHERE result = 'PENDING' AND target_time <= ?",
           (now_str,),
       )
       pending_trades = cursor.fetchall()
+
+      # Шукаємо найближчий майбутній час експірації серед активних угод
+      cursor.execute(
+          "SELECT MIN(target_time) FROM trades WHERE result = 'PENDING' AND"
+          " target_time > ?",
+          (now_str,),
+      )
+      next_target_row = cursor.fetchone()
+      next_target = next_target_row[0] if next_target_row else None
       conn.close()
 
+      # Обробка угод, час яких вийшов
       for trade in pending_trades:
         trade_id, chat_id, pair_name, signal_type, entry_price, target_time = (
             trade
@@ -166,7 +178,6 @@ def automated_trade_checker():
         if not ticker:
           continue
 
-        # Завантажуємо актуальну ціну на момент перевірки
         df = yf.download(
             ticker, period="1d", interval="1m", progress=False, session=session
         )
@@ -177,18 +188,14 @@ def automated_trade_checker():
 
         current_price = float(df["Close"].iloc[-1])
 
-        # Визначаємо результат автоматично
         outcome = "LOSS"
-        if "BUY" in signal_type:
-          if current_price > entry_price:
-            outcome = "WIN"
-        elif "SELL" in signal_type:
-          if current_price < entry_price:
-            outcome = "WIN"
+        if "BUY" in signal_type and current_price > entry_price:
+          outcome = "WIN"
+        elif "SELL" in signal_type and current_price < entry_price:
+          outcome = "WIN"
 
         update_signal_status(trade_id, outcome)
 
-        # Сповіщаємо користувача в Telegram
         icon = "✅ WIN" if outcome == "WIN" else "❌ LOSS"
         msg_text = (
             f"🏁 <b>Автоматичний результат угоди!</b>\nПара:"
@@ -198,8 +205,21 @@ def automated_trade_checker():
         )
         send_telegram_message(chat_id, msg_text)
 
+      # Розраховуємо, скільки часу спати до наступної експірації
+      if next_target:
+        next_dt = datetime.strptime(next_target, "%Y-%m-%d %H:%M:%S")
+        sleep_seconds = (next_dt - datetime.now()).total_seconds()
+        # Спимо точно до часу експірації (або мінімум 5 секунд, якщо час уже впритул)
+        sleep_time = max(5, sleep_seconds)
+      else:
+        # Якщо немає відкритих угод, перевіряємо знову через 60 секунд
+        sleep_time = 60
+
+      time.sleep(sleep_time)
+
     except Exception as e:
       print(f"Помилка у фоновому перевірнику: {e}")
+      time.sleep(30)
 
 
 # --- МАШИННЕ НАВЧАННЯ (ML FILTER) ---
@@ -344,6 +364,8 @@ def get_market_data(ticker, timeframe):
             .dropna()
         )
       return df
+  except (json.JSONDecodeError, ValueError, KeyError):
+    return None
   except Exception as e:
     print(f"Помилка завантаження даних для {ticker}: {e}")
     return None
@@ -408,7 +430,6 @@ def analyze_pair(pair_name, timeframe):
         else f"{dynamic_exp // 60} год"
     )
 
-    # Розрахунок точного часу завершення угоди для автоматичної перевірки
     target_time_dt = datetime.now() + timedelta(minutes=dynamic_exp)
     target_time_str = target_time_dt.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -442,8 +463,8 @@ def telegram_webhook():
     if text == "/start":
       send_telegram_message(
           chat_id,
-          "👋 Бот активовано! Повністю <b>автоматична перевірка угод</b> без"
-          " людського фактора + ШІ-фільтр.\nОберіть дію:",
+          "👋 Бот активовано! Перевірка угод адаптована під час експірації +"
+          " ШІ-фільтр.\nОберіть дію:",
           get_reply_keyboard(),
       )
 
@@ -457,7 +478,7 @@ def telegram_webhook():
     elif text == "📊 Аналіз усіх пар":
       send_telegram_message(
           chat_id,
-          "⏳ Глобальне сканування ринку з автофіксацією результатів...",
+          "⏳ Глобальне сканування ринку...",
       )
       signals_found = 0
       for pair_name in PAIRS_MAP.keys():
@@ -483,7 +504,7 @@ def telegram_webhook():
                 f" {res['z_score']:.2f}\nStochastic:"
                 f" {res['stoch']:.1f}\n⏱ Таймфрейм: <b>{tf}</b>\n⏳ Експірація:"
                 f" <b>{res['expiration']}</b>\nℹ️ <i>Результат буде"
-                " перевірено автоматично!</i>"
+                " перевірено автоматично в кінці експірації.</i>"
             )
             send_telegram_message(chat_id, msg_text)
 
@@ -503,7 +524,6 @@ def telegram_webhook():
     cb = update["callback_query"]
     data = cb["data"]
     chat_id = cb["message"]["chat"]["id"]
-    message_id = cb["message"]["message_id"]
 
     if data.startswith("analyze_"):
       pair_name = data.replace("analyze_", "")
@@ -546,7 +566,6 @@ def telegram_webhook():
 
 if __name__ == "__main__":
   init_db()
-  # Запуск фонового потоку для автоматичної перевірки угод
   checker_thread = threading.Thread(
       target=automated_trade_checker, daemon=True
   )
