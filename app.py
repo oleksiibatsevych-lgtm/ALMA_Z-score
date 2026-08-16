@@ -1,5 +1,4 @@
 from datetime import datetime, timedelta
-import json
 import os
 import sqlite3
 import threading
@@ -14,6 +13,7 @@ import yfinance as yf
 app = Flask(__name__)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 DB_NAME = "bot_stats.db"
+is_scanning = False  # Замок від паралельних сканувань
 
 session = requests.Session()
 session.headers.update({
@@ -24,7 +24,6 @@ session.headers.update({
 })
 
 ALL_TIMEFRAMES = ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "4h"]
-
 PAIRS_MAP = {
     "CHF/JPY": "CHFJPY=X",
     "AUD/CAD": "AUDCAD=X",
@@ -50,7 +49,7 @@ PAIRS_MAP = {
 }
 
 
-# --- РОБОТА З БАЗОЮ ДАНИХ ---
+# --- БАЗА ДАНИХ ТА СТАТИСТИКА ---
 def init_db():
   conn = sqlite3.connect(DB_NAME)
   cursor = conn.cursor()
@@ -125,7 +124,6 @@ def get_stats_report():
   )
   data = dict(cursor.fetchall())
   conn.close()
-
   win = data.get("WIN", 0)
   loss = data.get("LOSS", 0)
   total = win + loss
@@ -133,28 +131,19 @@ def get_stats_report():
   return win, loss, total, winrate
 
 
-# --- ФОНОВИЙ ПЕРЕВІРНИК УГОД ---
+# --- ФОНОВИЙ ПЕРЕВІРНИК РЕЗУЛЬТАТІВ УГОД ---
 def automated_trade_checker():
   while True:
     try:
       now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
       conn = sqlite3.connect(DB_NAME)
       cursor = conn.cursor()
-
       cursor.execute(
           "SELECT id, chat_id, pair, signal, price, target_time FROM trades"
           " WHERE result = 'PENDING' AND target_time <= ?",
           (now_str,),
       )
       pending_trades = cursor.fetchall()
-
-      cursor.execute(
-          "SELECT MIN(target_time) FROM trades WHERE result = 'PENDING' AND"
-          " target_time > ?",
-          (now_str,),
-      )
-      next_target_row = cursor.fetchone()
-      next_target = next_target_row[0] if next_target_row else None
       conn.close()
 
       for trade in pending_trades:
@@ -182,24 +171,14 @@ def automated_trade_checker():
 
         update_signal_status(trade_id, outcome)
         icon = "✅ WIN" if outcome == "WIN" else "❌ LOSS"
-        msg_text = (
+        msg = (
             f"🏁 <b>Результат угоди!</b>\nПара: <b>{pair_name}</b>\nСигнал:"
-            f" <b>{signal_type}</b>\nЦіна входу: {entry_price:.5f}\nЦіна виходу:"
+            f" <b>{signal_type}</b>\nВхід: {entry_price:.5f}\nВихід:"
             f" {current_price:.5f}\nСтатус: <b>{icon}</b>"
         )
-        send_telegram_message(chat_id, msg_text)
-
-      if next_target:
-        next_dt = datetime.strptime(next_target, "%Y-%m-%d %H:%M:%S")
-        sleep_time = max(
-            5, (next_dt - datetime.now()).total_seconds()
-        )
-      else:
-        sleep_time = 60
-
-      time.sleep(sleep_time)
-    except Exception as e:
-      print(f"Помилка у фоновому перевірнику: {e}")
+        send_telegram_message(chat_id, msg)
+      time.sleep(30)
+    except Exception:
       time.sleep(30)
 
 
@@ -213,13 +192,11 @@ def predict_ml_filter(curr_z, curr_stoch):
     )
     df_history = pd.read_sql(query, conn)
     conn.close()
-
     if len(df_history) < 10:
       return True
 
     X = df_history[["z_score", "stoch"]].values
     y = df_history["result"].apply(lambda r: 1 if r == "WIN" else 0).values
-
     if len(np.unique(y)) < 2:
       return True
 
@@ -227,13 +204,12 @@ def predict_ml_filter(curr_z, curr_stoch):
     model.fit(X, y)
     prediction = model.predict(np.array([[curr_z, curr_stoch]]))[0]
     probability = model.predict_proba(np.array([[curr_z, curr_stoch]]))[0][1]
-
     return prediction == 1 or probability >= 0.45
   except Exception:
     return True
 
 
-# --- ТЕЛЕГРАМ ФУНКЦІЇ ---
+# --- ТЕЛЕГРАМ ІНТЕРФЕЙС ---
 def send_telegram_message(chat_id, text, reply_markup=None):
   if not TELEGRAM_TOKEN:
     return
@@ -241,7 +217,10 @@ def send_telegram_message(chat_id, text, reply_markup=None):
   payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
   if reply_markup:
     payload["reply_markup"] = reply_markup
-  requests.post(url, json=payload)
+  try:
+    requests.post(url, json=payload, timeout=5)
+  except:
+    pass
 
 
 def get_reply_keyboard():
@@ -268,21 +247,7 @@ def get_pairs_grid_keyboard():
   return {"inline_keyboard": keyboard}
 
 
-def set_webhook_automatically():
-  """Автоматично прив'язує Webhook до Telegram під час запуску сервісу"""
-  if TELEGRAM_TOKEN:
-    render_url = os.environ.get("RENDER_EXTERNAL_URL")
-    if render_url:
-      webhook_url = f"{render_url}/webhook"
-      url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={webhook_url}"
-      try:
-        resp = requests.get(url, timeout=10).json()
-        print(f"Статус налаштування вебхука: {resp}")
-      except Exception as e:
-        print(f"Помилка встановлення вебхука: {e}")
-
-
-# --- ЗАВАНТАЖЕННЯ ДАНИХ З ОБРОБКОЮ ЛІМІТІВ ---
+# --- ЗАВАНТАЖЕННЯ ДАНИХ РИНКУ ---
 def get_market_data(ticker, timeframe):
   try:
     if timeframe in ["1m", "3m", "10m"]:
@@ -293,7 +258,6 @@ def get_market_data(ticker, timeframe):
         return None
       if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-
       if timeframe == "3m":
         df = (
             df.resample("3min")
@@ -302,7 +266,6 @@ def get_market_data(ticker, timeframe):
                 "High": "max",
                 "Low": "min",
                 "Close": "last",
-                "Volume": "sum",
             })
             .dropna()
         )
@@ -314,13 +277,11 @@ def get_market_data(ticker, timeframe):
                 "High": "max",
                 "Low": "min",
                 "Close": "last",
-                "Volume": "sum",
             })
             .dropna()
         )
       return df
-
-    elif timeframe in ["5m", "15m", "30m"]:
+    else:
       df = yf.download(
           ticker,
           period="60d",
@@ -333,36 +294,11 @@ def get_market_data(ticker, timeframe):
       if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
       return df
-
-    elif timeframe in ["1h", "4h"]:
-      df = yf.download(
-          ticker, period="max", interval="1h", progress=False, session=session
-      )
-      if df is None or df.empty:
-        return None
-      if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-
-      if timeframe == "4h":
-        df = (
-            df.resample("4h")
-            .agg({
-                "Open": "first",
-                "High": "max",
-                "Low": "min",
-                "Close": "last",
-                "Volume": "sum",
-            })
-            .dropna()
-        )
-      return df
-  except Exception as e:
-    # Ігноруємо помилки лімітів або декодування від Yahoo
+  except:
     return None
-  return None
 
 
-# --- СТРАТЕГІЯ ---
+# --- СТРАТЕГІЯ АНАЛІЗУ ---
 def analyze_pair(pair_name, timeframe):
   ticker = PAIRS_MAP.get(pair_name)
   if not ticker:
@@ -396,11 +332,7 @@ def analyze_pair(pair_name, timeframe):
     if not signal or not predict_ml_filter(float(curr_z), float(curr_stoch)):
       return None
 
-    multiplier = (
-        3
-        if "m" in timeframe
-        else (2 if "h" in timeframe else 1)
-    )
+    multiplier = 3 if "m" in timeframe else (2 if "h" in timeframe else 1)
     base_mins = (
         int(timeframe.replace("m", "").replace("h", ""))
         if timeframe.endswith(("m", "h"))
@@ -429,8 +361,55 @@ def analyze_pair(pair_name, timeframe):
         "target_time": target_time_str,
         "timeframe": timeframe,
     }
-  except Exception:
+  except:
     return None
+
+
+# --- ФОНОВЕ СКАНУВАННЯ З ЗАХИСТОМ ВІД БАНУ ---
+def run_global_scan(chat_id):
+  global is_scanning
+  if is_scanning:
+    send_telegram_message(
+        chat_id, "⏳ Бот вже проводить сканування, зачекайте..."
+    )
+    return
+  is_scanning = True
+  try:
+    send_telegram_message(
+        chat_id, "⏳ Глобальне сканування ринку запущено (з урахуванням ML)..."
+    )
+    signals_found = 0
+    for pair_name in PAIRS_MAP.keys():
+      for tf in ALL_TIMEFRAMES:
+        time.sleep(1.5)  # ПАУЗА ПРОТИ БАНУ YAHOO FINANCE
+        res = analyze_pair(pair_name, tf)
+        if res and res["signal"]:
+          signals_found += 1
+          save_signal_to_db(
+              chat_id,
+              res["pair"],
+              res["signal"],
+              res["price"],
+              tf,
+              res["expiration"],
+              res["target_time"],
+              res["z_score"],
+              res["stoch"],
+          )
+          msg = (
+              f"🚨 <b>Сигнал (AI Filtered)!</b>\nПара: <b>{res['pair']}</b>\nСигнал:"
+              f" <b>{res['signal']}</b>\nЦіна: {res['price']:.5f}\nZ-Score:"
+              f" {res['z_score']:.2f}\nStoch:"
+              f" {res['stoch']:.1f}\nТаймфрейм: <b>{tf}</b>\nЕкспірація:"
+              f" <b>{res['expiration']}</b>"
+          )
+          send_telegram_message(chat_id, msg)
+    if signals_found == 0:
+      send_telegram_message(
+          chat_id, "💤 За результатами сканування якісних сигналів немає."
+      )
+  finally:
+    is_scanning = False
 
 
 # --- WEBHOOK ОБРОБНИК ---
@@ -448,30 +427,44 @@ def telegram_webhook():
     if text in ["/start", "/help"]:
       send_telegram_message(
           chat_id,
-          "👋 Бот успішно підключено та готовий до роботи!\nОберіть дію на"
-          " клавіатурі нижче:",
+          "👋 Бот успішно підключено! Оберіть дію на клавіатурі нижче:",
           get_reply_keyboard(),
       )
-
     elif text == "💲 Пари":
       send_telegram_message(
           chat_id,
-          "📌 Оберіть пару для сканування:",
+          "📌 Оберіть пару для швидкого сканування:",
           get_pairs_grid_keyboard(),
       )
-
-    elif text in ["/signal", "📊 Аналіз усіх пар"]:
-      send_telegram_message(
-          chat_id, "⏳ Глобальне сканування ринку (зачекайте кілька секунд)..."
+    elif text == "📊 Аналіз усіх пар":
+      threading.Thread(
+          target=run_global_scan, args=(chat_id,), daemon=True
+      ).start()
+    elif text == "📈 Статистика":
+      win, loss, total, winrate = get_stats_report()
+      report = (
+          f"📊 <b>Статистика угод:</b>\n\n✅ WIN: {win}\n❌ LOSS:"
+          f" {loss}\n📦 Всього: {total}\n📈 Winrate: <b>{winrate:.2f}%</b>"
       )
-      signals_found = 0
-      for pair_name in PAIRS_MAP.keys():
+      send_telegram_message(chat_id, report)
+
+  elif "callback_query" in update:
+    cb = update["callback_query"]
+    data = cb["data"]
+    chat_id = cb["message"]["chat"]["id"]
+    if data.startswith("analyze_"):
+      pair_name = data.replace("analyze_", "")
+
+      def scan_single(c_id, p_name):
+        send_telegram_message(c_id, f"🔍 Скаנую пару {p_name} по всіх таймфреймах...")
+        found = 0
         for tf in ALL_TIMEFRAMES:
-          res = analyze_pair(pair_name, tf)
+          time.sleep(1.0)
+          res = analyze_pair(p_name, tf)
           if res and res["signal"]:
-            signals_found += 1
+            found += 1
             save_signal_to_db(
-                chat_id,
+                c_id,
                 res["pair"],
                 res["signal"],
                 res["price"],
@@ -481,85 +474,23 @@ def telegram_webhook():
                 res["z_score"],
                 res["stoch"],
             )
-            msg_text = (
-                f"🚨 <b>Сигнал (AI Filtered)!</b>\nПара: <b>{res['pair']}</b>\nСигнал:"
+            msg = (
+                f"🚨 <b>Сигнал для {res['pair']}</b>\nСигнал:"
                 f" <b>{res['signal']}</b>\nЦіна: {res['price']:.5f}\nZ-Score:"
-                f" {res['z_score']:.2f}\nStochastic:"
-                f" {res['stoch']:.1f}\n⏱ Таймфрейм: <b>{tf}</b>\n⏳ Експірація:"
-                f" <b>{res['expiration']}</b>"
+                f" {res['z_score']:.2f}\nТаймфрейм: <b>{tf}</b>"
             )
-            send_telegram_message(chat_id, msg_text)
-          time.sleep(
-              0.2
-          )  # невелика пауза, щоб не навантажувати запитами Yahoo
+            send_telegram_message(c_id, msg)
+        if found == 0:
+          send_telegram_message(c_id, f"ℹ️ По парі <b>{p_name}</b> сигналів немає.")
 
-      if signals_found == 0:
-        send_telegram_message(
-            chat_id,
-            "💤 Зараз немає якісних сигналів по заданих критеріях.",
-        )
-
-    elif text == "📈 Статистика":
-      win, loss, total, winrate = get_stats_report()
-      report = (
-          f"📊 <b>Статистика торгових сигналів:</b>\n\n✅ WIN: {win}\n❌ LOSS:"
-          f" {loss}\n📦 Всього: {total}\n📈 Winrate: <b>{winrate:.2f}%</b>"
-      )
-      send_telegram_message(chat_id, report)
-
-  elif "callback_query" in update:
-    cb = update["callback_query"]
-    data = cb["data"]
-    chat_id = cb["message"]["chat"]["id"]
-
-    if data.startswith("analyze_"):
-      pair_name = data.replace("analyze_", "")
-      send_telegram_message(
-          chat_id, f"🔍 Сканую пару {pair_name} по всіх таймфреймах..."
-      )
-      signals_found = 0
-      for tf in ALL_TIMEFRAMES:
-        res = analyze_pair(pair_name, tf)
-        if res and res["signal"]:
-          signals_found += 1
-          save_signal_out = save_signal_to_db(
-              chat_id,
-              res["pair"],
-              res["signal"],
-              res["price"],
-              tf,
-              res["expiration"],
-              res["target_time"],
-              res["z_score"],
-              res["stoch"],
-          )
-          msg_text = (
-              f"🚨 <b>Сигнал для {res['pair']}</b>\nСигнал:"
-              f" <b>{res['signal']}</b>\nЦіна: {res['price']:.5f}\nZ-Score:"
-              f" {res['z_score']:.2f}\nStochastic:"
-              f" {res['stoch']:.1f}\n⏱ Таймфрейм: <b>{tf}</b>\n⏳ Експірація:"
-              f" <b>{res['expiration']}</b>"
-          )
-          send_telegram_message(chat_id, msg_text)
-
-      if signals_found == 0:
-        send_telegram_message(
-            chat_id, f"ℹ️ По парі <b>{pair_name}</b> сигналів немає."
-        )
+      threading.Thread(
+          target=scan_single, args=(chat_id, pair_name), daemon=True
+      ).start()
 
   return "OK", 200
 
 
 if __name__ == "__main__":
   init_db()
-
-  # Запуск фонового потоку перевірки угод
-  checker_thread = threading.Thread(
-      target=automated_trade_checker, daemon=True
-  )
-  checker_thread.start()
-
-  # Автоматичне підключення вебхука
-  set_webhook_automatically()
-
+  threading.Thread(target=automated_trade_checker, daemon=True).start()
   app.run(host="0.0.0.0", port=10000)
