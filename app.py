@@ -1,4 +1,3 @@
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 import os
 import sqlite3
@@ -8,10 +7,12 @@ import requests
 import yfinance as yf
 
 app = Flask(__name__)
-
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+DB_NAME = "bot_stats.db"
 
-# Точний словник пар
+# Список усіх таймфреймів, які бот перевіряє одночасно
+ALL_TIMEFRAMES = ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "4h"]
+
 PAIRS_MAP = {
     "CHF/JPY": "CHFJPY=X",
     "AUD/CAD": "AUDCAD=X",
@@ -36,131 +37,112 @@ PAIRS_MAP = {
     "GBP/CAD": "GBPCAD=X",
 }
 
-SCAN_TIMEFRAMES = {"1m": "5d", "3m": "5d", "5m": "1mo"}
 
-
-# ==================== РОБОТА З БД (SQLITE) ====================
+# --- РОБОТА З БАЗОЮ ДАНИХ ---
 def init_db():
-  conn = sqlite3.connect("bot_stats.db", check_same_thread=False)
+  conn = sqlite3.connect(DB_NAME)
   cursor = conn.cursor()
   cursor.execute("""
-        CREATE TABLE IF NOT EXISTS signals (
+        CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER,
             pair TEXT,
-            signal_type TEXT,
+            signal TEXT,
             price REAL,
-            status TEXT DEFAULT 'PENDING',
-            timestamp TEXT
+            timeframe TEXT,
+            expiration TEXT,
+            result TEXT DEFAULT 'PENDING',
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
   conn.commit()
   conn.close()
 
 
-def save_signal_to_db(chat_id, pair, signal_type, price):
-  try:
-    conn = sqlite3.connect("bot_stats.db", check_same_thread=False)
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-            INSERT INTO signals (chat_id, pair, signal_type, price, status, timestamp)
-            VALUES (?, ?, ?, ?, 'PENDING', ?)
-        """,
-        (
-            chat_id,
-            pair,
-            signal_type,
-            price,
-            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-        ),
-    )
-    signal_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    return signal_id
-  except Exception as e:
-    print(f"Помилка збереження в БД: {e}")
-    return None
-
-
-def update_signal_status(signal_id, status):
-  try:
-    conn = sqlite3.connect("bot_stats.db", check_same_thread=False)
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE signals SET status = ? WHERE id = ?", (status, signal_id)
-    )
-    conn.commit()
-    conn.close()
-  except Exception as e:
-    print(f"Помилка оновлення статусу: {e}")
-
-
-def get_db_statistics(period_days=None):
-  try:
-    conn = sqlite3.connect("bot_stats.db", check_same_thread=False)
-    cursor = conn.cursor()
-    time_filter = ""
-    if period_days:
-      limit_date = (
-          datetime.utcnow() - timedelta(days=period_days)
-      ).strftime("%Y-%m-%d %H:%M:%S")
-      time_filter = f"AND timestamp >= '{limit_date}'"
-
-    cursor.execute(f"""
-            SELECT COUNT(*), 
-                   SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END), 
-                   SUM(CASE WHEN status='LOSS' THEN 1 ELSE 0 END) 
-            FROM signals WHERE status != 'PENDING' {time_filter}
-        """)
-    tot, wins, losses = cursor.fetchone()
-    tot = tot or 0
-    wins = wins or 0
-    losses = losses or 0
-    winrate = round((wins / tot * 100), 1) if tot > 0 else 0
-
-    cursor.execute(f"""
-            SELECT pair, COUNT(*), 
-                   SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END), 
-                   SUM(CASE WHEN status='LOSS' THEN 1 ELSE 0 END) 
-            FROM signals WHERE status != 'PENDING' {time_filter} 
-            GROUP BY pair ORDER BY COUNT(*) DESC
-        """)
-    pairs_data = cursor.fetchall()
-    conn.close()
-    return {
-        "total": tot,
-        "wins": wins,
-        "losses": losses,
-        "winrate": winrate,
-        "pairs": pairs_data,
-    }
-  except Exception as e:
-    print(f"Помилка читання статистики: {e}")
-    return {"total": 0, "wins": 0, "losses": 0, "winrate": 0, "pairs": []}
-
-
-def format_stats_report(title, stats):
-  text = (
-      f"📊 *{title}*\n\n"
-      f"🎯 Закрито угод: `{stats['total']}`\n"
-      f"✅ Плюс (Win): `{stats['wins']}`\n"
-      f"❌ Мінус (Loss): `{stats['losses']}`\n"
-      f"📈 **Winrate:** `{stats['winrate']}%`\n\n"
-      f"💱 *По валютних парах*:\n"
+def save_signal_to_db(pair, signal, price, timeframe, expiration):
+  conn = sqlite3.connect(DB_NAME)
+  cursor = conn.cursor()
+  cursor.execute(
+      "INSERT INTO trades (pair, signal, price, timeframe, expiration) VALUES"
+      " (?, ?, ?, ?, ?)",
+      (pair, signal, price, timeframe, expiration),
   )
-  if not stats["pairs"]:
-    text += "_Ще немає закритого торгового результату за цей період._"
-  else:
-    for p, tot, w, l in stats["pairs"]:
-      p_wr = round((w / tot * 100), 1) if tot > 0 else 0
-      text += f"🔹 *{p}*: угод `{tot}` | Плюс `{w}` | Мінус `{l}` | Winrate: **`{p_wr}%`**\n"
-  return text
+  trade_id = cursor.lastrowid
+  conn.commit()
+  conn.close()
+  return trade_id
 
 
-# ==================== МЕНЮ ТА КЛАВІАТУРИ ====================
-def get_main_menu_keyboard():
+def update_signal_status(trade_id, status):
+  conn = sqlite3.connect(DB_NAME)
+  cursor = conn.cursor()
+  cursor.execute(
+      "UPDATE trades SET result = ? WHERE id = ?", (status, trade_id)
+  )
+  conn.commit()
+  conn.close()
+
+
+def get_stats_report(days=None):
+  conn = sqlite3.connect(DB_NAME)
+  cursor = conn.cursor()
+  query = 'SELECT result, COUNT(*) FROM trades WHERE result IN ("WIN", "LOSS")'
+  params = []
+  if days:
+    date_limit = (datetime.now() - timedelta(days=days)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    query += " AND timestamp >= ?"
+    params.append(date_limit)
+  query += " GROUP BY result"
+  cursor.execute(query, params)
+  data = dict(cursor.fetchall())
+  conn.close()
+
+  win = data.get("WIN", 0)
+  loss = data.get("LOSS", 0)
+  total = win + loss
+  winrate = (win / total * 100) if total > 0 else 0
+  return win, loss, total, winrate
+
+
+# --- ТЕЛЕГРАМ ФУНКЦІЇ ---
+def send_telegram_message(chat_id, text, reply_markup=None):
+  if not TELEGRAM_TOKEN:
+    return
+  url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+  payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+  if reply_markup:
+    payload["reply_markup"] = reply_markup
+  requests.post(url, json=payload)
+
+
+def edit_telegram_message(chat_id, message_id, text, reply_markup=None):
+  if not TELEGRAM_TOKEN:
+    return
+  url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
+  payload = {
+      "chat_id": chat_id,
+      "message_id": message_id,
+      "text": text,
+      "parse_mode": "HTML",
+  }
+  if reply_markup:
+    payload["reply_markup"] = reply_markup
+  requests.post(url, json=payload)
+
+
+# Клавіатури інтерфейсу (без кнопки вибору таймфрейму, оскільки перевіряються всі одразу)
+def get_reply_keyboard():
+  return {
+      "keyboard": [
+          [{"text": "💲 Пари"}],
+          [{"text": "📊 Аналіз усіх пар"}, {"text": "📈 Статистика"}],
+      ],
+      "resize_keyboard": True,
+  }
+
+
+def get_pairs_grid_keyboard():
   pairs_list = list(PAIRS_MAP.keys())
   keyboard = []
   for i in range(0, len(pairs_list), 2):
@@ -171,223 +153,150 @@ def get_main_menu_keyboard():
           "callback_data": f"analyze_{pairs_list[i+1]}",
       })
     keyboard.append(row)
-  keyboard.append(
-      [{"text": "📊 Аналіз усіх пар", "callback_data": "analyze_all"}]
-  )
-  keyboard.append([{"text": "📈 Статистика", "callback_data": "menu_stats"}])
   return {"inline_keyboard": keyboard}
 
 
-# ==================== TELEGRAM API ====================
-def send_telegram_message(chat_id, text, reply_markup=None):
-  if not chat_id:
-    return
-  url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-  payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-  if reply_markup:
-    payload["reply_markup"] = reply_markup
+# --- ЗАВАНТАЖЕННЯ ДАНИХ ТА РЕСЕМПЛІНГ ПІД БУДЬ-ЯКИЙ ТАЙМФРЕЙМ ---
+def get_market_data(ticker, timeframe):
   try:
-    requests.post(url, json=payload, timeout=10)
-  except Exception as e:
-    print(f"Помилка відправки: {e}")
-
-
-def edit_telegram_message(chat_id, message_id, text, reply_markup=None):
-  url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
-  payload = {
-      "chat_id": chat_id,
-      "message_id": message_id,
-      "text": text,
-      "parse_mode": "Markdown",
-  }
-  if reply_markup:
-    payload["reply_markup"] = reply_markup
-  try:
-    requests.post(url, json=payload, timeout=10)
-  except Exception as e:
-    print(f"Помилка редагування: {e}")
-
-
-def edit_telegram_reply_markup(chat_id, message_id, reply_markup):
-  url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageReplyMarkup"
-  payload = {
-      "chat_id": chat_id,
-      "message_id": message_id,
-      "reply_markup": reply_markup,
-  }
-  try:
-    requests.post(url, json=payload, timeout=10)
-  except Exception as e:
-    print(f"Помилка оновлення розмітки: {e}")
-
-
-def is_active_trading_session():
-  now_utc = datetime.utcnow()
-  hour = now_utc.hour
-  if now_utc.weekday() < 5 and (7 <= hour <= 19):
-    return True
-  return False
-
-
-def calculate_stochastic(df, k_period=14, d_period=3):
-  low_min = df["Low"].rolling(window=k_period).min()
-  high_max = df["High"].rolling(window=k_period).max()
-  k_line = 100 * ((df["Close"] - low_min) / (high_max - low_min))
-  d_line = k_line.rolling(window=d_period).mean()
-  return k_line, d_line
-
-
-def calculate_rsi(df, period=14):
-  delta = df["Close"].diff()
-  gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-  loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-  rs = gain / loss
-  rsi = 100 - (100 / (1 + rs))
-  return rsi
-
-
-def get_htf_trend(ticker):
-  try:
-    df_htf = yf.download(ticker, period="5d", interval="1h", progress=False)
-    if df_htf.empty or len(df_htf) < 20:
-      return "NEUTRAL"
-    if isinstance(df_htf.columns, pd.MultiIndex):
-      df_htf.columns = df_htf.columns.get_level_values(0)
-    close = df_htf["Close"]
-    ema50 = (
-        close.ewm(
-            span=50 if len(close) >= 50 else len(close) - 1, adjust=False
-        )
-        .mean()
-        .iloc[-1]
-    )
-    current_price = close.iloc[-1]
-    if current_price > ema50:
-      return "BULLISH"
-    elif current_price < ema50:
-      return "BEARISH"
-  except:
-    pass
-  return "NEUTRAL"
-
-
-def analyze_single_pair(display_name, chat_id):
-  ticker = PAIRS_MAP.get(display_name)
-  if not ticker:
-    return None
-  htf_trend = get_htf_trend(ticker)
-  if htf_trend == "NEUTRAL":
-    return None
-
-  for tf, period in SCAN_TIMEFRAMES.items():
-    try:
-      df = yf.download(ticker, period=period, interval=tf, progress=False)
-      if df.empty or len(df) < 30:
-        continue
+    if timeframe in ["1m", "3m", "10m"]:
+      df = yf.download(ticker, period="5d", interval="1m", progress=False)
+      if df.empty:
+        return None
       if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-      close = df["Close"]
-      high = df["High"]
-      low = df["Low"]
-      open_p = df["Open"]
-      current_price = close.iloc[-1]
 
-      k_line, _ = calculate_stochastic(df)
-      k_val = k_line.iloc[-1]
-      rsi_line = calculate_rsi(df)
-      rsi_val = rsi_line.iloc[-1]
-
-      if pd.isna(k_val) or pd.isna(rsi_val):
-        continue
-
-      swing_high = high.iloc[-30:].max()
-      swing_low = low.iloc[-30:].min()
-      diff = swing_high - swing_low
-      if diff == 0:
-        continue
-
-      fib_618 = swing_high - (diff * 0.618)
-      fib_786 = swing_high - (diff * 0.786)
-      in_ote_buy = (current_price <= fib_618) and (current_price >= fib_786)
-
-      fib_sell_low = swing_low + (diff * 0.382)
-      fib_sell_high = swing_low + (diff * 0.618)
-      in_ote_sell = (current_price >= fib_sell_low) and (
-          current_price <= fib_sell_high
-      )
-
-      is_bullish_ob = (close.iloc[-1] > open_p.iloc[-1]) and (
-          close.iloc[-2] < open_p.iloc[-2]
-      )
-      is_bearish_ob = (close.iloc[-1] < open_p.iloc[-1]) and (
-          close.iloc[-2] > open_p.iloc[-2]
-      )
-
-      liquidity_sweep_buy = low.iloc[-1] <= low.iloc[-10:-1].min()
-      liquidity_sweep_sell = high.iloc[-1] >= high.iloc[-10:-1].max()
-
-      if tf == "1m":
-        exp_str = "3-5 хв"
-      elif tf == "3m":
-        exp_str = "5-10 хв"
-      else:
-        exp_str = "15-20 хв"
-
-      if (
-          htf_trend == "BULLISH"
-          and in_ote_buy
-          and is_bullish_ob
-          and liquidity_sweep_buy
-          and k_val < 40
-          and rsi_val > 40
-      ):
-        signal_id = save_signal_to_db(chat_id, display_name, "BUY", current_price)
-        signal_text = (
-            f"🟢 **BUY (SMC + Fib + Sweep | ТФ: {tf})** | 🌟"
-            f" **{display_name}**\n⏱ Експірація: `{exp_str}`\nЦіна:"
-            f" `{current_price:.5f}` | Stoch: `{k_val:.1f}` | RSI:"
-            f" `{rsi_val:.1f}`\n\n👇 **Позначте результат після завершення"
-            " угоди:**"
+      if timeframe == "3m":
+        df = (
+            df.resample("3min")
+            .agg({
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+                "Volume": "sum",
+            })
+            .dropna()
         )
-        keyboard = {
-            "inline_keyboard": [[
-                {"text": "✅ Плюс (Win)", "callback_data": f"win_{signal_id}"},
-                {"text": "❌ Мінус (Loss)", "callback_data": f"loss_{signal_id}"},
-            ]]
-        }
-        return (signal_text, keyboard)
+      elif timeframe == "10m":
+        df = (
+            df.resample("10min")
+            .agg({
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+                "Volume": "sum",
+            })
+            .dropna()
+        )
+      return df
 
-      elif (
-          htf_trend == "BEARISH"
-          and in_ote_sell
-          and is_bearish_ob
-          and liquidity_sweep_sell
-          and k_val > 60
-          and rsi_val < 60
-      ):
-        signal_id = save_signal_to_db(
-            chat_id, display_name, "SELL", current_price
+    elif timeframe in ["5m", "15m", "30m"]:
+      df = yf.download(ticker, period="60d", interval=timeframe, progress=False)
+      if df.empty:
+        return None
+      if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+      return df
+
+    elif timeframe in ["1h", "4h"]:
+      df = yf.download(ticker, period="max", interval="1h", progress=False)
+      if df.empty:
+        return None
+      if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+      if timeframe == "4h":
+        df = (
+            df.resample("4h")
+            .agg({
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+                "Volume": "sum",
+            })
+            .dropna()
         )
-        signal_text = (
-            f"🔴 **SELL (SMC + Fib + Sweep | ТФ: {tf})** | 🌟"
-            f" **{display_name}**\n⏱ Експірація: `{exp_str}`\nЦіна:"
-            f" `{current_price:.5f}` | Stoch: `{k_val:.1f}` | RSI:"
-            f" `{rsi_val:.1f}`\n\n👇 **Позначте результат після завершення"
-            " угоди:**"
-        )
-        keyboard = {
-            "inline_keyboard": [[
-                {"text": "✅ Плюс (Win)", "callback_data": f"win_{signal_id}"},
-                {"text": "❌ Мінус (Loss)", "callback_data": f"loss_{signal_id}"},
-            ]]
-        }
-        return (signal_text, keyboard)
-    except Exception as e:
-      continue
+      return df
+  except Exception as e:
+    print(f"Помилка завантаження даних для {ticker}: {e}")
+    return None
   return None
 
 
-# ==================== FLASK ROUTE ====================
+# --- СТРАТЕГІЯ STOCHASTIC Z-SCORE ---
+def analyze_pair(pair_name, timeframe):
+  ticker = PAIRS_MAP.get(pair_name)
+  if not ticker:
+    return None
+  try:
+    df = get_market_data(ticker, timeframe)
+    if df is None or len(df) < 50:
+      return None
+
+    close = df["Close"]
+    sma = close.rolling(window=20).mean()
+    std = close.rolling(window=20).std()
+    z_score = (close - sma) / std
+
+    low_min = df["Low"].rolling(window=14).min()
+    high_max = df["High"].rolling(window=14).max()
+    stoch = 100 * (close - low_min) / (high_max - low_min)
+
+    trend = close.rolling(window=50).mean()
+
+    curr_z = z_score.iloc[-1]
+    curr_stoch = stoch.iloc[-1]
+    curr_trend = trend.iloc[-1]
+    curr_price = close.iloc[-1]
+
+    signal = None
+    if curr_z < -2.0 and curr_stoch < 20 and curr_price > curr_trend:
+      signal = "BUY (CALL)"
+    elif curr_z > 2.0 and curr_stoch > 80 and curr_price < curr_trend:
+      signal = "SELL (PUT)"
+
+    if not signal:
+      return None
+
+    # Динамічний час експірації залежно від таймфрейму
+    multiplier = (
+        3
+        if "m" in timeframe
+        else (2 if "h" in timeframe else 1)
+    )
+    base_mins = (
+        int(timeframe.replace("m", "").replace("h", ""))
+        if timeframe.endswith(("m", "h"))
+        else 5
+    )
+    if "h" in timeframe:
+      base_mins *= 60
+
+    dynamic_exp = int(base_mins * multiplier)
+    expiration_str = (
+        f"{dynamic_exp} хв"
+        if dynamic_exp < 60
+        else f"{dynamic_exp // 60} год"
+    )
+
+    return {
+        "pair": pair_name,
+        "signal": signal,
+        "price": float(curr_price),
+        "z_score": float(curr_z),
+        "stoch": float(curr_stoch),
+        "expiration": expiration_str,
+        "timeframe": timeframe,
+    }
+  except Exception as e:
+    print(f"Помилка аналізу {pair_name} на {timeframe}: {e}")
+    return None
+
+
+# --- WEBHOOK ОБРОБНИК ---
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
   update = request.get_json()
@@ -395,146 +304,166 @@ def telegram_webhook():
     return "OK", 200
 
   if "message" in update:
-    chat_id = update["message"]["chat"]["id"]
-    text = update["message"].get("text", "")
+    msg = update["message"]
+    chat_id = msg["chat"]["id"]
+    text = msg.get("text", "")
+
     if text == "/start":
       send_telegram_message(
           chat_id,
-          "👋 **Оберіть пару для аналізу або скористайтеся меню:**",
-          get_main_menu_keyboard(),
+          "👋 Бот активовано! Стратегія Stochastic Z-Score.\nБот"
+          " <b>автоматично перевіряє всі таймфрейми одразу</b> (1m, 3m, 5m,"
+          " 10m, 15m, 30m, 1h, 4h). Оберіть дію:",
+          get_reply_keyboard(),
       )
 
-  elif "callback_query" in update:
-    query = update["callback_query"]
-    chat_id = query["message"]["chat"]["id"]
-    message_id = query["message"]["message_id"]
-    data = query["data"]
-
-    if data.startswith("analyze_") and data != "analyze_all":
-      display_name = data.replace("analyze_", "")
-      send_telegram_message(chat_id, f"⏳ Сканую пару *{display_name}*...")
-      res = analyze_single_pair(display_name, chat_id)
-      if res:
-        sig_text, kb = res
-        send_telegram_message(chat_id, sig_text, kb)
-      else:
-        send_telegram_message(
-            chat_id,
-            f"📭 Зараз немає активних сигналів по парі *{display_name}* за"
-            " суворими критеріями.",
-        )
-
-    elif data == "analyze_all":
-      if not is_active_trading_session():
-        send_telegram_message(
-            chat_id,
-            "⚠️ Увага: Зараз поза межами активних сесій (робочий час: 10:00 -"
-            " 22:00 за Києвом).",
-        )
+    elif text == "💲 Пари":
       send_telegram_message(
-          chat_id, "⏳ Починаю паралельне сканування всіх 21 пар..."
+          chat_id,
+          "📌 Оберіть пару для миттєвого сканування по всіх таймфреймах:",
+          get_pairs_grid_keyboard(),
+      )
+
+    elif text == "📊 Аналіз усіх пар":
+      send_telegram_message(
+          chat_id,
+          "⏳ Повне глобальне сканування всіх пар та всіх таймфреймів...",
       )
       signals_found = 0
-      with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {
-            executor.submit(analyze_single_pair, pair_name, chat_id): pair_name
-            for pair_name in PAIRS_MAP.keys()
-        }
-        for future in as_completed(futures):
-          res = future.result()
-          if res:
-            sig_text, kb = res
-            send_telegram_message(chat_id, sig_text, kb)
+      for pair_name in PAIRS_MAP.keys():
+        for tf in ALL_TIMEFRAMES:
+          res = analyze_pair(pair_name, tf)
+          if res and res["signal"]:
             signals_found += 1
+            trade_id = save_signal_to_db(
+                res["pair"],
+                res["signal"],
+                res["price"],
+                tf,
+                res["expiration"],
+            )
+            markup = {
+                "inline_keyboard": [[
+                    {"text": "✅ WIN", "callback_data": f"res_{trade_id}_WIN"},
+                    {
+                        "text": "❌ LOSS",
+                        "callback_data": f"res_{trade_id}_LOSS",
+                    },
+                ]]
+            }
+            msg_text = (
+                f"🚨 <b>Сигнал (Stochastic Z-Score)!</b>\nПара:"
+                f" <b>{res['pair']}</b>\nСигнал:"
+                f" <b>{res['signal']}</b>\nЦіна: {res['price']:.5f}\nZ-Score:"
+                f" {res['z_score']:.2f}\nStochastic:"
+                f" {res['stoch']:.1f}\n⏱ Таймфрейм: <b>{tf}</b>\n⏳ Експірація:"
+                f" <b>{res['expiration']}</b>"
+            )
+            send_telegram_message(chat_id, msg_text, markup)
 
       if signals_found == 0:
         send_telegram_message(
-            chat_id, "📭 Зараз немає активних сигналів по жодній парі."
-        )
-      else:
-        send_telegram_message(
             chat_id,
-            f"✅ Сканування завершено. Знайдено якісних сигналів:"
-            f" {signals_found}",
+            "💤 На жодному з таймфреймів екстремальних точок входів наразі"
+            " немає.",
         )
 
-    elif data == "menu_stats":
-      keyboard = {
-          "inline_keyboard": [
-              [
-                  {"text": "📅 За добу", "callback_data": "stats|day"},
-                  {"text": "📆 За тиждень", "callback_data": "stats|week"},
-              ],
-              [{"text": "📈 За весь час", "callback_data": "stats|all"}],
-              [{"text": "🔙 Головне меню", "callback_data": "menu_back"}],
-          ]
-      }
-      edit_telegram_message(
-          chat_id, message_id, "📊 **Виберіть період статистики:**", keyboard
+    elif text == "📈 Статистика":
+      win, loss, total, winrate = get_stats_report()
+      report = (
+          f"📊 <b>Статистика торгових сигналів:</b>\n\n✅ Перемог (WIN):"
+          f" {win}\n❌ Поразок (LOSS): {loss}\n📦 Загалом угод:"
+          f" {total}\n📈 Вінрейт (Winrate): <b>{winrate:.2f}%</b>"
       )
-
-    elif data == "menu_back":
-      edit_telegram_message(
+      send_telegram_message(
           chat_id,
-          message_id,
-          "👋 **Оберіть пару для аналізу або скористайтеся меню:**",
-          get_main_menu_keyboard(),
-      )
-
-    elif data.startswith("stats|"):
-      _, period = data.split("|")
-      if period == "day":
-        st = get_db_statistics(period_days=1)
-        text = format_stats_report("Статистика за добу", st)
-      elif period == "week":
-        st = get_db_statistics(period_days=7)
-        text = format_stats_report("Статистика за тиждень", st)
-      else:
-        st = get_db_statistics(period_days=None)
-        text = format_stats_report("Статистика за весь час", st)
-
-      keyboard = {
-          "inline_keyboard": [
-              [
-                  {"text": "📅 За добу", "callback_data": "stats|day"},
-                  {"text": "📆 За тиждень", "callback_data": "stats|week"},
-              ],
-              [{"text": "📈 За весь час", "callback_data": "stats|all"}],
-              [{"text": "🔄 Оновити", "callback_data": f"stats|{period}"}],
-              [{"text": "🔙 Головне меню", "callback_data": "menu_back"}],
-          ]
-      }
-      edit_telegram_message(chat_id, message_id, text, keyboard)
-
-    elif data.startswith("win_") or data.startswith("loss_"):
-      status = "WIN" if data.startswith("win_") else "LOSS"
-      signal_id = data.split("_")[1]
-      update_signal_status(signal_id, status)
-      status_text = (
-          "🟢 Зараховано як ПЛЮС (Win)"
-          if status == "WIN"
-          else "🔴 Зараховано як МІНУС (Loss)"
-      )
-      edit_telegram_reply_markup(
-          chat_id,
-          message_id,
-          {
-              "inline_keyboard": [[{
-                  "text": f"Статус: {status_text}",
-                  "callback_data": "none",
-              }]]
+          report,
+          reply_markup={
+              "inline_keyboard": [
+                  [
+                      {"text": "📅 За добу", "callback_data": "stats_day"},
+                      {"text": "📆 За тиждень", "callback_data": "stats_week"},
+                  ],
+                  [{"text": "📈 За весь час", "callback_data": "stats_all"}],
+              ]
           },
       )
+
+  elif "callback_query" in update:
+    cb = update["callback_query"]
+    data = cb["data"]
+    chat_id = cb["message"]["chat"]["id"]
+    message_id = cb["message"]["message_id"]
+
+    if data.startswith("res_"):
+      _, trade_id, outcome = data.split("_")
+      update_signal_status(trade_id, outcome)
+      new_text = cb["message"]["text"] + f"\n\n<b>Статус: {outcome} ✅</b>"
+      edit_telegram_message(chat_id, message_id, new_text, reply_markup=None)
+
+    elif data.startswith("analyze_"):
+      pair_name = data.replace("analyze_", "")
+      send_telegram_message(
+          chat_id, f"🔍 Сканую всі таймфрейми для пари {pair_name}..."
+      )
+      signals_found = 0
+      for tf in ALL_TIMEFRAMES:
+        res = analyze_pair(pair_name, tf)
+        if res and res["signal"]:
+          signals_found += 1
+          trade_id = save_signal_to_db(
+              res["pair"],
+              res["signal"],
+              res["price"],
+              tf,
+              res["expiration"],
+          )
+          markup = {
+              "inline_keyboard": [[
+                  {"text": "✅ WIN", "callback_data": f"res_{trade_id}_WIN"},
+                  {
+                      "text": "❌ LOSS",
+                      "callback_data": f"res_{trade_id}_LOSS",
+                  },
+              ]]
+          }
+          msg_text = (
+              f"🚨 <b>Сигнал для {res['pair']}</b>\nСигнал:"
+              f" <b>{res['signal']}</b>\nЦіна: {res['price']:.5f}\nZ-Score:"
+              f" {res['z_score']:.2f}\nStochastic:"
+              f" {res['stoch']:.1f}\n⏱ Таймфрейм: <b>{tf}</b>\n⏳ Експірація:"
+              f" <b>{res['expiration']}</b>"
+          )
+          send_telegram_message(chat_id, msg_text, markup)
+
+      if signals_found == 0:
+        send_telegram_message(
+            chat_id,
+            f"ℹ️ По парі <b>{pair_name}</b> на жодному з таймфреймів немає"
+            " екстремуму.",
+        )
+
+    elif data.startswith("stats_"):
+      days = None
+      period_name = "за весь час"
+      if data == "stats_day":
+        days = 1
+        period_name = "за добу"
+      elif data == "stats_week":
+        days = 7
+        period_name = "за тиждень"
+
+      win, loss, total, winrate = get_stats_report(days)
+      report = (
+          f"📊 <b>Статистика ({period_name}):</b>\n\n✅ Перемог:"
+          f" {win}\n❌ Поразок:"
+          f" {loss}\n📦 Угод: {total}\n📈 Winrate: <b>{winrate:.2f}%</b>"
+      )
+      edit_telegram_message(chat_id, message_id, report)
 
   return "OK", 200
 
 
-@app.route("/")
-def home():
-  return "21-Pairs SMC Bot with SQLite & Win/Loss is running!"
-
-
 if __name__ == "__main__":
   init_db()
-  port = int(os.environ.get("PORT", 10000))
-  app.run(host="0.0.0.0", port=port)
+  app.run(host="0.0.0.0", port=10000)
