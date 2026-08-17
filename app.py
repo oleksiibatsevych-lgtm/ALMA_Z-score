@@ -18,14 +18,29 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 session = requests.Session()
 session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
 
+# Повний список із 21 валютної пари
 PAIRS_MAP = {
     "EUR/USD": "EURUSD=X",
     "GBP/USD": "GBPUSD=X",
     "USD/JPY": "USDJPY=X",
     "AUD/USD": "AUDUSD=X",
     "USD/CAD": "USDCAD=X",
+    "USD/CHF": "USDCHF=X",
+    "NZD/USD": "NZDUSD=X",
+    "EUR/GBP": "EURGBP=X",
     "EUR/JPY": "EURJPY=X",
     "GBP/JPY": "GBPJPY=X",
+    "AUD/JPY": "AUDJPY=X",
+    "EUR/AUD": "EURAUD=X",
+    "EUR/CAD": "EURCAD=X",
+    "GBP/AUD": "GBPAUD=X",
+    "GBP/CAD": "GBPCAD=X",
+    "CHF/JPY": "CHFJPY=X",
+    "CAD/JPY": "CADJPY=X",
+    "NZD/JPY": "NZDJPY=X",
+    "AUD/NZD": "AUDNZD=X",
+    "EUR/CHF": "EURCHF=X",
+    "GBP/CHF": "GBPCHF=X",
 }
 
 is_scanning = False
@@ -205,10 +220,10 @@ def run_global_scan(chat_id):
         return
     is_scanning = True
     try:
-        send_telegram_message(chat_id, "⏳ Глобальне сканування ринку з ALMA та пакетним ресемплінгом...")
+        send_telegram_message(chat_id, "⏳ Глобальне сканування ринку (21 пара з ALMA)...")
         signals_found = 0
         for pair_name in PAIRS_MAP.keys():
-            time.sleep(0.8)
+            time.sleep(1.0) # Безпечна пауза між запитами пар
             results = analyze_pair_all_tfs(pair_name)
             for res in results:
                 signals_found += 1
